@@ -1,16 +1,14 @@
 extern crate libc;
 extern crate x11;
-use crate::linux::common::{convert, FALSE, KEYBOARD};
+use crate::linux::common::{convert, KEYBOARD};
 use crate::linux::keyboard::Keyboard;
 use crate::rdev::{Event, ListenError};
-use std::convert::TryInto;
 use std::ffi::CStr;
-use std::os::raw::{c_char, c_int, c_uchar, c_uint, c_ulong};
+use std::mem;
 use std::ptr::null;
+use x11::xinput2;
 use x11::xlib;
-use x11::xrecord;
 
-static mut RECORD_ALL_CLIENTS: c_ulong = xrecord::XRecordAllClients;
 static mut GLOBAL_CALLBACK: Option<Box<dyn FnMut(Event)>> = None;
 
 pub fn listen<T>(callback: T) -> Result<(), ListenError>
@@ -22,93 +20,97 @@ where
     unsafe {
         KEYBOARD = Some(keyboard);
         GLOBAL_CALLBACK = Some(Box::new(callback));
-        // Open displays
-        let dpy_control = xlib::XOpenDisplay(null());
-        if dpy_control.is_null() {
+
+        let disp = xlib::XOpenDisplay(null());
+        if disp.is_null() {
             return Err(ListenError::MissingDisplayError);
         }
-        let extension_name = CStr::from_bytes_with_nul(b"RECORD\0")
-            .map_err(|_| ListenError::XRecordExtensionError)?;
-        let extension = xlib::XInitExtension(dpy_control, extension_name.as_ptr());
-        if extension.is_null() {
-            return Err(ListenError::XRecordExtensionError);
+
+        let mut xi_opcode: i32 = 0;
+        {
+            let mut query_event: i32 = 0;
+            let mut query_error: i32 = 0;
+            let extension_name = CStr::from_bytes_with_nul(b"XInputExtension\0").unwrap();
+            if xlib::XQueryExtension(
+                disp,
+                extension_name.as_ptr(),
+                &mut xi_opcode,
+                &mut query_event,
+                &mut query_error,
+            ) == 0
+            {
+                return Err(ListenError::XRecordExtensionError);
+            }
         }
 
-        // Prepare record range
-        let mut record_range: xrecord::XRecordRange = *xrecord::XRecordAllocRange();
-        record_range.device_events.first = xlib::KeyPress as c_uchar;
-        record_range.device_events.last = xlib::MotionNotify as c_uchar;
+        // Register to receive XInput events
+        let root_wnd = xlib::XDefaultRootWindow(disp);
+        let mut mask_data: [u8; 5] = mem::zeroed();
+        let mut m = xinput2::XIEventMask {
+            deviceid: xinput2::XIAllMasterDevices,
+            mask_len: 5,
+            mask: mask_data.as_mut_ptr(),
+        };
+        xinput2::XISetMask(&mut mask_data, xinput2::XI_RawKeyPress);
+        xinput2::XISetMask(&mut mask_data, xinput2::XI_RawMotion);
+        xinput2::XISelectEvents(disp, root_wnd, &mut m, 1);
+        xlib::XSync(disp, 0);
 
-        // Create context
-        let context = xrecord::XRecordCreateContext(
-            dpy_control,
-            0,
-            &mut RECORD_ALL_CLIENTS,
-            1,
-            &mut &mut record_range as *mut &mut xrecord::XRecordRange
-                as *mut *mut xrecord::XRecordRange,
-            1,
-        );
+        xlib::XkbSelectEventDetails(disp, 0x0100, 2, 1 << 4, 1 << 4);
+        //let mut state: xlib::XkbStateRec = mem::zeroed();
+        //xlib::XkbGetState(disp, 0x0100, &mut state);
+        //let group = state.group;
 
-        if context == 0 {
-            return Err(ListenError::RecordContextError);
-        }
+        loop {
+            let mut event: xlib::XEvent = mem::zeroed();
+            xlib::XNextEvent(disp, &mut event);
+            let cookie = &mut *{ &mut event.generic_event_cookie };
 
-        xlib::XSync(dpy_control, FALSE);
-        // Run
-        let result =
-            xrecord::XRecordEnableContext(dpy_control, context, Some(record_callback), &mut 0);
-        if result == 0 {
-            return Err(ListenError::RecordContextEnablingError);
+            if xlib::XGetEventData(disp, cookie) == 1 {
+                if cookie.type_ == xlib::GenericEvent && cookie.extension == xi_opcode {
+                    if cookie.evtype == xinput2::XI_RawKeyPress {
+                        let ev = &mut *{ cookie.data as *mut xinput2::XIRawEvent };
+                        if let Some(event) =
+                            convert(&mut KEYBOARD, ev.detail as u32, xlib::KeyPress, 0.0, 0.0)
+                        {
+                            if let Some(callback) = &mut GLOBAL_CALLBACK {
+                                callback(event);
+                            }
+                        }
+                    }
+                    else if cookie.evtype == xinput2::XI_RawMotion {
+                        let mut root_ret: u64 = 0;
+                        let mut child_ret: u64 = 0;
+                        let mut root_x: i32 = 0;
+                        let mut root_y: i32 = 0;
+                        let mut win_x: i32 = 0;
+                        let mut win_y: i32 = 0;
+                        let mut mask_ret: u32 = 0;
+                        if xlib::XQueryPointer(
+                            disp,
+                            root_wnd,
+                            &mut root_ret,
+                            &mut child_ret,
+                            &mut root_x,
+                            &mut root_y,
+                            &mut win_x,
+                            &mut win_y,
+                            &mut mask_ret
+                        ) == 0
+                        {
+                            continue;
+                        }
+
+                        if let Some(event) =
+                            convert(&mut KEYBOARD, 0, xlib::MotionNotify, root_x as f64, root_y as f64)
+                        {
+                            if let Some(callback) = &mut GLOBAL_CALLBACK {
+                                callback(event);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
-    Ok(())
-}
-
-// No idea how to do that properly relevant doc lives here:
-// https://www.x.org/releases/X11R7.7/doc/libXtst/recordlib.html#Datum_Flags
-// https://docs.rs/xproto/1.1.5/xproto/struct._xEvent__bindgen_ty_1.html
-// 0.4.2: xproto was removed for some reason and contained the real structs
-// but we can't use it anymore.
-#[repr(C)]
-struct XRecordDatum {
-    type_: u8,
-    code: u8,
-    _rest: u64,
-    _1: bool,
-    _2: bool,
-    _3: bool,
-    root_x: i16,
-    root_y: i16,
-    event_x: i16,
-    event_y: i16,
-    state: u16,
-}
-
-unsafe extern "C" fn record_callback(
-    _null: *mut c_char,
-    raw_data: *mut xrecord::XRecordInterceptData,
-) {
-    let data = raw_data.as_ref().unwrap();
-    if data.category != xrecord::XRecordFromServer {
-        return;
-    }
-
-    debug_assert!(data.data_len * 4 >= std::mem::size_of::<XRecordDatum>().try_into().unwrap());
-    // Cast binary data
-    #[allow(clippy::cast_ptr_alignment)]
-    let xdatum = (data.data as *const XRecordDatum).as_ref().unwrap();
-
-    let code: c_uint = xdatum.code.into();
-    let type_: c_int = xdatum.type_.into();
-
-    let x = xdatum.root_x as f64;
-    let y = xdatum.root_y as f64;
-
-    if let Some(event) = convert(&mut KEYBOARD, code, type_, x, y) {
-        if let Some(callback) = &mut GLOBAL_CALLBACK {
-            callback(event);
-        }
-    }
-    xrecord::XRecordFreeData(raw_data);
 }

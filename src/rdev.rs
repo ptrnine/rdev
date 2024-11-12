@@ -29,6 +29,8 @@ pub enum ListenError {
     RecordContextError,
     /// Linux
     XRecordExtensionError,
+    /// Linux
+    XInput2ExtensionError,
     /// Windows
     KeyHookError(u32),
     /// Windows
