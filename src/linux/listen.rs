@@ -52,6 +52,7 @@ where
             mask: mask_data.as_mut_ptr(),
         };
         xinput2::XISetMask(&mut mask_data, xinput2::XI_RawKeyPress);
+        xinput2::XISetMask(&mut mask_data, xinput2::XI_RawKeyRelease);
         xinput2::XISetMask(&mut mask_data, xinput2::XI_RawMotion);
         xinput2::XISelectEvents(disp, root_wnd, &mut m, 1);
         xlib::XSync(disp, 0);
@@ -68,17 +69,24 @@ where
 
             if xlib::XGetEventData(disp, cookie) == 1 {
                 if cookie.type_ == xlib::GenericEvent && cookie.extension == xi_opcode {
-                    if cookie.evtype == xinput2::XI_RawKeyPress {
+                    if [xinput2::XI_RawKeyPress, xinput2::XI_RawKeyRelease].contains(&cookie.evtype) {
                         let ev = &mut *{ cookie.data as *mut xinput2::XIRawEvent };
-                        if let Some(event) =
-                            convert(&mut KEYBOARD, ev.detail as u32, xlib::KeyPress, 0.0, 0.0)
-                        {
+                        if let Some(event) = convert(
+                            &mut KEYBOARD,
+                            ev.detail as u32,
+                            if cookie.evtype == xinput2::XI_RawKeyPress {
+                                xlib::KeyPress
+                            } else {
+                                xlib::KeyRelease
+                            },
+                            0.0,
+                            0.0,
+                        ) {
                             if let Some(callback) = &mut GLOBAL_CALLBACK {
                                 callback(event);
                             }
                         }
-                    }
-                    else if cookie.evtype == xinput2::XI_RawMotion {
+                    } else if cookie.evtype == xinput2::XI_RawMotion {
                         let mut root_ret: u64 = 0;
                         let mut child_ret: u64 = 0;
                         let mut root_x: i32 = 0;
@@ -95,15 +103,19 @@ where
                             &mut root_y,
                             &mut win_x,
                             &mut win_y,
-                            &mut mask_ret
+                            &mut mask_ret,
                         ) == 0
                         {
                             continue;
                         }
 
-                        if let Some(event) =
-                            convert(&mut KEYBOARD, 0, xlib::MotionNotify, root_x as f64, root_y as f64)
-                        {
+                        if let Some(event) = convert(
+                            &mut KEYBOARD,
+                            0,
+                            xlib::MotionNotify,
+                            root_x as f64,
+                            root_y as f64,
+                        ) {
                             if let Some(callback) = &mut GLOBAL_CALLBACK {
                                 callback(event);
                             }
