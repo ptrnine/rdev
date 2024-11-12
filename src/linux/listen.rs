@@ -110,6 +110,7 @@ where
                         }
                     }
                 }
+                xlib::XFreeEventData(disp, cookie);
             }
         }
     }
